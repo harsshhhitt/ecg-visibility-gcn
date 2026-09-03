@@ -1,0 +1,10 @@
+data/raw/
+data/processed/
+outputs/checkpoints/
+outputs/figures/
+outputs/reports/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
