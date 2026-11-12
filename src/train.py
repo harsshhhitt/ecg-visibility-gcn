@@ -1,5 +1,5 @@
-"""Stage 4: Training loop — inter-patient split, weighted loss, checkpointing,
-early stopping on validation macro-F1.
+"""Stage 4: Training loop — inter-patient split, class-balanced oversampling,
+checkpointing, early stopping on validation macro-F1.
 """
 
 import argparse
@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
+from torch.utils.data import WeightedRandomSampler
 from torch_geometric.loader import DataLoader
 
 from config import AAMI_CLASSES, CHECKPOINT_DIR, PROCESSED_DATA_DIR
@@ -34,14 +35,22 @@ def safe_stratified_split(indices, labels, **split_kwargs):
     return train_test_split(indices, **split_kwargs)
 
 
-def class_weights(dataset, num_classes=len(AAMI_CLASSES)):
-    """Inverse-frequency class weights for weighted cross-entropy."""
+def class_counts(labels, num_classes=len(AAMI_CLASSES)):
     counts = np.zeros(num_classes)
-    for data in dataset:
-        counts[int(data.y.item())] += 1
-    counts = np.clip(counts, 1, None)  # avoid div-by-zero for absent classes
-    weights = counts.sum() / (num_classes * counts)
-    return torch.tensor(weights, dtype=torch.float)
+    for label in labels:
+        counts[label] += 1
+    return np.clip(counts, 1, None)  # avoid div-by-zero for absent classes
+
+
+def make_oversampler(labels, num_classes=len(AAMI_CLASSES)):
+    """WeightedRandomSampler that oversamples minority classes so each
+    training batch is drawn roughly class-balanced, instead of relying on
+    loss weighting alone (which leaves rare classes under-represented in
+    every gradient step)."""
+    counts = class_counts(labels, num_classes)
+    class_weight = counts.sum() / (num_classes * counts)
+    sample_weights = [class_weight[label] for label in labels]
+    return WeightedRandomSampler(sample_weights, num_samples=len(labels), replacement=True)
 
 
 def run_epoch(model, loader, optimizer, criterion, device, train=True):
@@ -106,8 +115,10 @@ def train(
     )
     train_set = train_full[train_idx]
     val_set = train_full[val_idx]
+    train_labels = [labels[i] for i in train_idx]
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    sampler = make_oversampler(train_labels)
+    train_loader = DataLoader(train_set, batch_size=batch_size, sampler=sampler)
     val_loader = DataLoader(val_set, batch_size=batch_size)
 
     model = ECGGCN(in_channels=2, num_classes=len(AAMI_CLASSES)).to(device)
@@ -116,7 +127,7 @@ def train(
         logger.info("Resumed weights from %s", resume_from)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.5)
-    criterion = torch.nn.CrossEntropyLoss(weight=class_weights(train_full).to(device))
+    criterion = torch.nn.CrossEntropyLoss()
 
     best_val_f1, epochs_no_improve = -1.0, 0
     for epoch in range(1, epochs + 1):
