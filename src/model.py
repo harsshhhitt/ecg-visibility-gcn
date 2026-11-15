@@ -7,17 +7,24 @@ GCNConv(2->64) -> ReLU -> GCNConv(64->64) -> ReLU -> GCNConv(64->64) -> ReLU
 
 import torch
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, global_mean_pool
+from torch_geometric.nn import GATv2Conv, GCNConv, SAGEConv, global_max_pool, global_mean_pool
 
 
 class ECGGCN(torch.nn.Module):
-    def __init__(self, in_channels=2, hidden_channels=64, num_classes=5, dropout=0.3):
-        super().__init__()
-        self.conv1 = GCNConv(in_channels, hidden_channels)
-        self.conv2 = GCNConv(hidden_channels, hidden_channels)
-        self.conv3 = GCNConv(hidden_channels, hidden_channels)
+    """arch: 'gcn' (default, original), 'sage' (GraphSAGE) or 'gat' (GATv2).
+    pooling: 'mean' (default) or 'meanmax' (concatenated mean+max readout)."""
 
-        self.lin1 = torch.nn.Linear(hidden_channels, 32)
+    def __init__(self, in_channels=2, hidden_channels=64, num_classes=5, dropout=0.3,
+                 arch="gcn", pooling="mean"):
+        super().__init__()
+        conv = {"gcn": GCNConv, "sage": SAGEConv, "gat": GATv2Conv}[arch]
+        self.pooling = pooling
+        self.conv1 = conv(in_channels, hidden_channels)
+        self.conv2 = conv(hidden_channels, hidden_channels)
+        self.conv3 = conv(hidden_channels, hidden_channels)
+
+        readout = hidden_channels * (2 if pooling == "meanmax" else 1)
+        self.lin1 = torch.nn.Linear(readout, 32)
         self.lin2 = torch.nn.Linear(32, num_classes)
         self.dropout = dropout
 
@@ -26,7 +33,10 @@ class ECGGCN(torch.nn.Module):
         x = F.relu(self.conv2(x, edge_index))
         x = F.relu(self.conv3(x, edge_index))
 
-        x = global_mean_pool(x, batch)
+        if self.pooling == "meanmax":
+            x = torch.cat([global_mean_pool(x, batch), global_max_pool(x, batch)], dim=1)
+        else:
+            x = global_mean_pool(x, batch)
 
         x = F.relu(self.lin1(x))
         x = F.dropout(x, p=self.dropout, training=self.training)

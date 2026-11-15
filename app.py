@@ -6,6 +6,7 @@ Run with:
     streamlit run app.py
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -18,7 +19,9 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from config import AAMI_CLASSES, CHECKPOINT_DIR  # noqa: E402
 from image_digitize import digitize_waveform  # noqa: E402
-from predict import predict_beat  # noqa: E402
+from predict import predict_beat, predict_with_uncertainty  # noqa: E402
+from visibility_graph import graph_stats  # noqa: E402
+from explain import node_saliency, plot_explanation  # noqa: E402
 
 CLASS_DESCRIPTIONS = {
     "N": "Normal beat",
@@ -50,7 +53,14 @@ st.warning(
     icon="⚠️",
 )
 
+SAMPLES_DIR = Path(__file__).parent / "samples"
+sample_files = sorted(SAMPLES_DIR.glob("*.png")) if SAMPLES_DIR.exists() else []
+sample_choice = st.sidebar.selectbox("Or try a bundled sample", ["(none)"] + [p.name for p in sample_files])
+mc_samples = st.sidebar.slider("MC-dropout passes (uncertainty)", 10, 100, 30, step=10)
+
 uploaded = st.file_uploader("ECG waveform image", type=["png", "jpg", "jpeg"])
+if uploaded is None and sample_choice != "(none)":
+    uploaded = open(SAMPLES_DIR / sample_choice, "rb")
 
 threshold = st.slider(
     "Trace darkness threshold (lower = stricter, only very dark pixels count as trace)",
@@ -88,6 +98,33 @@ if uploaded is not None:
         st.error(f"**Abnormal** — AAMI class **{label}**: {CLASS_DESCRIPTIONS[label]}")
 
     st.bar_chart({c: probs[c] for c in AAMI_CLASSES})
+    st.metric("Confidence", f"{probs[label]:.1%}")
+
+    mean_p, std_p, entropy = predict_with_uncertainty(waveform, n_samples=mc_samples)
+    stats = graph_stats(data)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Uncertainty (entropy)", f"{entropy:.2f}", help="0 = certain, 1 = maximally uncertain (MC dropout)")
+    c2.metric("Graph nodes", stats["nodes"])
+    c3.metric("Graph edges", stats["edges"])
+    c4.metric("Mean degree", f"{stats['mean_degree']:.1f}")
+    if entropy > 0.6:
+        st.warning("High predictive uncertainty - treat this prediction with extra caution.")
+
+    report = {"prediction": label, "probabilities": probs, "mc_dropout_mean": mean_p,
+              "mc_dropout_std": std_p, "uncertainty_entropy": entropy, "graph": stats}
+    st.download_button("Download JSON report", json.dumps(report, indent=2),
+                       file_name="ecg_prediction.json", mime="application/json")
+
+    with st.expander("Why this prediction? (gradient x input saliency)", expanded=True):
+        st.caption(
+            "Importance of each ECG sample (graph node) to the predicted-class logit. "
+            "Bright regions are the parts of the beat the GCN relied on most."
+        )
+        sal, _, _ = node_saliency(waveform)
+        expl_fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        plot_explanation(waveform, sal, label, probs, ax_list=axes)
+        st.pyplot(expl_fig)
+        plt.close(expl_fig)
 
     with st.expander("Visibility graph structure"):
         fig, ax = plt.subplots(figsize=(6, 4))

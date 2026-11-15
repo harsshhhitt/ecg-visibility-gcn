@@ -3,6 +3,7 @@ checkpointing, early stopping on validation macro-F1.
 """
 
 import argparse
+import json
 import logging
 
 import numpy as np
@@ -13,7 +14,7 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import WeightedRandomSampler
 from torch_geometric.loader import DataLoader
 
-from config import AAMI_CLASSES, CHECKPOINT_DIR, PROCESSED_DATA_DIR
+from config import AAMI_CLASSES, CHECKPOINT_DIR, PROCESSED_DATA_DIR, REPORTS_DIR
 from dataset import ECGVisibilityGraphDataset
 from model import ECGGCN
 
@@ -81,6 +82,29 @@ def run_epoch(model, loader, optimizer, criterion, device, train=True):
     return total_loss / len(loader.dataset), macro_f1
 
 
+def save_history(history, reports_dir=REPORTS_DIR):
+    """Persist per-epoch metrics as JSON and render loss / macro-F1 curves."""
+    import matplotlib.pyplot as plt
+
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    with open(reports_dir / "training_history.json", "w") as f:
+        json.dump(history, f, indent=2)
+    epochs = range(1, len(history["train_loss"]) + 1)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    axes[0].plot(epochs, history["train_loss"], label="train")
+    axes[0].plot(epochs, history["val_loss"], label="val")
+    axes[0].set(xlabel="Epoch", ylabel="Cross-entropy loss", title="Loss")
+    axes[1].plot(epochs, history["train_f1"], label="train")
+    axes[1].plot(epochs, history["val_f1"], label="val")
+    axes[1].set(xlabel="Epoch", ylabel="Macro-F1", title="Macro-F1")
+    for ax in axes:
+        ax.legend()
+        ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(reports_dir / "training_curves.png", dpi=150)
+    plt.close(fig)
+
+
 def train(
     epochs=100,
     batch_size=128,
@@ -92,6 +116,8 @@ def train(
     checkpoint_dir=CHECKPOINT_DIR,
     max_samples=None,
     resume_from=None,
+    arch="gcn",
+    pooling="mean",
 ):
     """max_samples: if set, stratified-subsample DS1 down to this many graphs
     before splitting — for a fast demo run rather than a full training pass.
@@ -121,7 +147,7 @@ def train(
     train_loader = DataLoader(train_set, batch_size=batch_size, sampler=sampler)
     val_loader = DataLoader(val_set, batch_size=batch_size)
 
-    model = ECGGCN(in_channels=2, num_classes=len(AAMI_CLASSES)).to(device)
+    model = ECGGCN(in_channels=2, num_classes=len(AAMI_CLASSES), arch=arch, pooling=pooling).to(device)
     if resume_from is not None:
         model.load_state_dict(torch.load(resume_from, map_location=device))
         logger.info("Resumed weights from %s", resume_from)
@@ -130,10 +156,14 @@ def train(
     criterion = torch.nn.CrossEntropyLoss()
 
     best_val_f1, epochs_no_improve = -1.0, 0
+    history = {"train_loss": [], "train_f1": [], "val_loss": [], "val_f1": [], "lr": []}
     for epoch in range(1, epochs + 1):
         train_loss, train_f1 = run_epoch(model, train_loader, optimizer, criterion, device, train=True)
         val_loss, val_f1 = run_epoch(model, val_loader, optimizer, criterion, device, train=False)
         scheduler.step(val_loss)
+        for k, v in (("train_loss", train_loss), ("train_f1", train_f1), ("val_loss", val_loss),
+                     ("val_f1", val_f1), ("lr", optimizer.param_groups[0]["lr"])):
+            history[k].append(float(v))
 
         logger.info(
             "Epoch %03d | train_loss=%.4f train_f1=%.4f | val_loss=%.4f val_f1=%.4f",
@@ -151,6 +181,7 @@ def train(
 
         torch.save(model.state_dict(), checkpoint_dir / "last_model.pt")
 
+    save_history(history)
     return model, best_val_f1
 
 
@@ -165,6 +196,8 @@ if __name__ == "__main__":
                          help="Subsample DS1 to this many graphs for a fast demo run.")
     parser.add_argument("--resume-from", type=str, default=None,
                          help="Checkpoint path to initialize weights from before training.")
+    parser.add_argument("--arch", choices=["gcn", "sage", "gat"], default="gcn")
+    parser.add_argument("--pooling", choices=["mean", "meanmax"], default="mean")
     args = parser.parse_args()
-    train(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
+    train(arch=args.arch, pooling=args.pooling, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
           patience=args.patience, max_samples=args.max_samples, resume_from=args.resume_from)

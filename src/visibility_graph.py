@@ -59,6 +59,21 @@ def beat_to_networkx(beat: Beat) -> nx.Graph:
     return vg.as_networkx()
 
 
+def graph_stats(data: Data) -> dict:
+    """Summary topology of a beat's visibility graph (edge_index holds both directions)."""
+    n = data.num_nodes
+    m = data.edge_index.shape[1] // 2
+    deg = torch.bincount(data.edge_index[0], minlength=n).float()
+    return {
+        "nodes": n,
+        "edges": m,
+        "density": float(2 * m / max(n * (n - 1), 1)),
+        "mean_degree": float(deg.mean()),
+        "max_degree": int(deg.max()),
+        "hub_position": float(deg.argmax()) / max(n - 1, 1),  # where the biggest hub sits (0..1)
+    }
+
+
 if __name__ == "__main__":
     import numpy as np
 
