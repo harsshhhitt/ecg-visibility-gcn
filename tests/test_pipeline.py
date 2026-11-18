@@ -71,3 +71,35 @@ def test_graph_stats():
     from visibility_graph import graph_stats
     s = graph_stats(beat_to_graph(_beat()))
     assert s["nodes"] == 200 and s["edges"] >= 199 and 0 < s["density"] <= 1
+
+
+def test_degree_features_idempotent():
+    from visibility_graph import add_degree_features
+    d = add_degree_features(beat_to_graph(_beat()))
+    assert d.x.shape == (200, 4)
+    assert add_degree_features(d).x.shape == (200, 4)
+    assert float(d.x[:, 2].max()) <= 1.0
+
+
+def test_ensemble_classifier_and_calibration():
+    from torch_geometric.data import Batch
+    from ensemble import Classifier
+    from train_ensemble import fit_biases, fit_temperature
+    b = Batch.from_data_list([add_deg(_beat()), add_deg(_beat("V", 150))])
+    cfgs = [dict(arch=a, pooling="meanmax", in_channels=4) for a in ("gcn", "sage", "gat")]
+    clf = Classifier([ECGGCN(**c) for c in cfgs], temperature=2.0, degree_features=True).eval()
+    assert clf(b.x, b.edge_index, b.batch).shape == (2, 5)
+    p, spread = clf.probs_with_spread(b.x, b.edge_index, b.batch)
+    assert torch.allclose(p.sum(1), torch.ones(2), atol=1e-5) and spread.shape == (2, 5)
+
+    torch.manual_seed(0)
+    logits = torch.randn(300, 5) * 4          # over-confident random logits
+    y = torch.randint(0, 4, (300,))
+    assert fit_temperature(logits, y) > 1.0   # over-confidence => T > 1
+    bias, f1 = fit_biases(logits, y, 1.0)
+    assert bias.shape == (5,) and bias[0] == 0 and f1 >= 0
+
+
+def add_deg(beat):
+    from visibility_graph import add_degree_features
+    return add_degree_features(beat_to_graph(beat))

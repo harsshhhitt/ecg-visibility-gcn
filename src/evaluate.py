@@ -22,7 +22,8 @@ from torch_geometric.loader import DataLoader
 
 from config import AAMI_CLASSES, CHECKPOINT_DIR, FIGURES_DIR, IDX_TO_CLASS, PROCESSED_DATA_DIR, REPORTS_DIR
 from dataset import ECGVisibilityGraphDataset
-from model import ECGGCN
+from ensemble import load_classifier
+from visibility_graph import add_degree_features
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -31,13 +32,16 @@ logger = logging.getLogger(__name__)
 @torch.no_grad()
 def predict(model, loader, device):
     model.eval()
-    all_probs, all_labels = [], []
+    all_probs, all_labels, all_raw = [], [], []
     for batch in loader:
         batch = batch.to(device)
-        out = model(batch.x, batch.edge_index, batch.batch)
+        raw = model.raw_logits(batch.x, batch.edge_index, batch.batch)  # ensemble-mean logits, uncalibrated
+        out = raw / model.temperature + model.bias
         all_probs.append(torch.softmax(out, dim=1).cpu())
+        all_raw.append(raw.cpu())
         all_labels.append(batch.y.cpu())
     probs = torch.cat(all_probs).numpy()
+    predict.last_raw = torch.cat(all_raw).numpy()
     return probs.argmax(axis=1), torch.cat(all_labels).numpy(), probs
 
 
@@ -124,13 +128,12 @@ def plot_waveform_and_graph(waveform, nx_graph, title, out_path):
 
 def evaluate(checkpoint_path=None, device=None, reference_macro_f1=None):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint_path = checkpoint_path or (CHECKPOINT_DIR / "best_model.pt")
+    model = load_classifier(checkpoint_path, device)  # ensemble if present, else legacy checkpoint
 
-    test_set = ECGVisibilityGraphDataset(root=str(PROCESSED_DATA_DIR), split="ds2")
+    test_set = ECGVisibilityGraphDataset(
+        root=str(PROCESSED_DATA_DIR), split="ds2",
+        transform=add_degree_features if model.degree_features else None)
     test_loader = DataLoader(test_set, batch_size=128)
-
-    model = ECGGCN(in_channels=2, num_classes=len(AAMI_CLASSES)).to(device)
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 
     preds, labels, probs = predict(model, test_loader, device)
 
@@ -143,6 +146,8 @@ def evaluate(checkpoint_path=None, device=None, reference_macro_f1=None):
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(REPORTS_DIR / "ds2_logits.npz", raw_logits=predict.last_raw, labels=labels,
+                        temperature=float(model.temperature), bias=model.bias.numpy())
 
     sens_spec = per_class_sens_spec(cm)
     curve_stats = plot_roc_pr(labels, probs, AAMI_CLASSES, REPORTS_DIR / "roc_pr_curves.png")
@@ -183,5 +188,6 @@ if __name__ == "__main__":
     parser.add_argument("--reference-macro-f1", type=float, default=None,
                          help="Published reference macro-F1 to compare against.")
     args = parser.parse_args()
-    ckpt = args.checkpoint or (CHECKPOINT_DIR / "best_model.pt")
+    from pathlib import Path
+    ckpt = Path(args.checkpoint) if args.checkpoint else None
     evaluate(checkpoint_path=ckpt, reference_macro_f1=args.reference_macro_f1)

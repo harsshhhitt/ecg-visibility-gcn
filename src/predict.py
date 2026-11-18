@@ -11,51 +11,65 @@ import numpy as np
 import torch
 from torch_geometric.data import Batch
 
-from config import AAMI_CLASSES, CHECKPOINT_DIR, IDX_TO_CLASS
-from model import ECGGCN
+from config import AAMI_CLASSES, IDX_TO_CLASS
+from ensemble import load_classifier, prior_adjust_bias
 from preprocessing import Beat
-from visibility_graph import beat_to_graph, beat_to_networkx
+from visibility_graph import add_degree_features, beat_to_graph, beat_to_networkx
 
 logger = logging.getLogger(__name__)
 
 _model_cache = {}
 
 
-def load_model(checkpoint_path=CHECKPOINT_DIR / "best_model.pt", device="cpu"):
+def load_model(checkpoint_path=None, device="cpu"):
+    """Returns the calibrated ensemble classifier (falls back to the legacy single GCN)."""
     key = str(checkpoint_path)
     if key not in _model_cache:
-        model = ECGGCN(in_channels=2, num_classes=len(AAMI_CLASSES)).to(device)
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        model.eval()
-        _model_cache[key] = model
+        _model_cache[key] = load_classifier(checkpoint_path, device)
     return _model_cache[key]
 
 
-def predict_beat(waveform: np.ndarray, checkpoint_path=CHECKPOINT_DIR / "best_model.pt", device="cpu"):
-    """Returns (predicted_label, class_probabilities dict, PyG Data, NetworkX graph)."""
+def set_sensitivity(tau, checkpoint_path=None, device="cpu"):
+    """Move the decision threshold: tau=0 favours overall accuracy (predict the common class),
+    tau=1 is the class-balanced rule, larger tau favours catching rare classes at the cost of
+    more false alarms. No-op for a legacy single-model checkpoint."""
+    clf = load_model(checkpoint_path, device)
+    counts = getattr(clf, "train_counts", None)
+    if counts is not None:
+        clf.bias.copy_(torch.tensor(prior_adjust_bias(counts, tau), dtype=torch.float))
+    return clf
+
+
+def build_graph(waveform, clf):
+    """Waveform -> PyG Data with the node-feature layout the classifier was trained on."""
     beat = Beat(record_id=-1, r_peak_sample=len(waveform) // 2, waveform=waveform, label="N")
     data = beat_to_graph(beat)
+    return add_degree_features(data) if clf.degree_features else data
+
+
+def predict_beat(waveform: np.ndarray, checkpoint_path=None, device="cpu"):
+    """Returns (predicted_label, class_probabilities dict, PyG Data, NetworkX graph)."""
+    model = load_model(checkpoint_path, device)
+    beat = Beat(record_id=-1, r_peak_sample=len(waveform) // 2, waveform=waveform, label="N")
+    data = build_graph(waveform, model)
     nx_graph = beat_to_networkx(beat)
 
-    model = load_model(checkpoint_path, device)
     batch = Batch.from_data_list([data]).to(device)
     with torch.no_grad():
-        logits = model(batch.x, batch.edge_index, batch.batch)
-        probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+        probs = torch.softmax(model(batch.x, batch.edge_index, batch.batch), dim=1).squeeze(0).cpu().numpy()
 
-    pred_idx = int(probs.argmax())
-    pred_label = IDX_TO_CLASS[pred_idx]
+    pred_label = IDX_TO_CLASS[int(probs.argmax())]
     prob_dict = {AAMI_CLASSES[i]: float(probs[i]) for i in range(len(AAMI_CLASSES))}
     return pred_label, prob_dict, data, nx_graph
 
 
-def predict_with_uncertainty(waveform, n_samples=30, checkpoint_path=CHECKPOINT_DIR / "best_model.pt", device="cpu"):
-    """Monte-Carlo dropout: keep dropout active and average n_samples passes.
-    Returns (mean_probs dict, std_probs dict, predictive_entropy in [0, 1])."""
-    beat = Beat(record_id=-1, r_peak_sample=len(waveform) // 2, waveform=waveform, label="N")
-    batch = Batch.from_data_list([beat_to_graph(beat)]).to(device)
+def predict_with_uncertainty(waveform, n_samples=30, checkpoint_path=None, device="cpu"):
+    """Monte-Carlo dropout over the whole ensemble: dropout stays active and n_samples
+    passes are averaged. Returns (mean_probs dict, std_probs dict, predictive_entropy in [0, 1]).
+    The std includes both dropout noise and disagreement between ensemble members."""
     model = load_model(checkpoint_path, device)
-    model.train()  # enable dropout (no batchnorm in this model, so this is safe)
+    batch = Batch.from_data_list([build_graph(waveform, model)]).to(device)
+    model.train()  # enable dropout (no batchnorm in these models, so this is safe)
     try:
         with torch.no_grad():
             runs = torch.stack([

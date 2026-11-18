@@ -59,6 +59,22 @@ def beat_to_networkx(beat: Beat) -> nx.Graph:
     return vg.as_networkx()
 
 
+def add_degree_features(data: Data) -> Data:
+    """Per-beat z-score the amplitude channel (removes patient/lead gain and offset, which a
+    visibility graph is already invariant to) and append normalized degree and log-degree
+    (2 -> 4 channels). Idempotent: a graph that already has 4 channels is returned unchanged."""
+    if data.x.shape[1] >= 4:
+        return data
+    n = data.num_nodes
+    deg = torch.bincount(data.edge_index[0], minlength=n).float()
+    extra = torch.stack([deg / max(n - 1, 1), torch.log1p(deg) / np.log(max(n, 2))], dim=1)
+    amp = data.x[:, :1]
+    amp = (amp - amp.mean()) / (amp.std() + 1e-6)
+    data = data.clone()
+    data.x = torch.cat([amp, data.x[:, 1:2], extra], dim=1)
+    return data
+
+
 def graph_stats(data: Data) -> dict:
     """Summary topology of a beat's visibility graph (edge_index holds both directions)."""
     n = data.num_nodes

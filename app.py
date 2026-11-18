@@ -6,7 +6,9 @@ Run with:
     streamlit run app.py
 """
 
+import io
 import json
+import tempfile
 import sys
 from pathlib import Path
 
@@ -19,8 +21,9 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from config import AAMI_CLASSES, CHECKPOINT_DIR  # noqa: E402
 from image_digitize import digitize_waveform  # noqa: E402
-from predict import predict_beat, predict_with_uncertainty  # noqa: E402
+from predict import predict_beat, predict_with_uncertainty, set_sensitivity  # noqa: E402
 from visibility_graph import graph_stats  # noqa: E402
+from report import build_report  # noqa: E402
 from explain import node_saliency, plot_explanation  # noqa: E402
 
 CLASS_DESCRIPTIONS = {
@@ -56,6 +59,11 @@ st.warning(
 SAMPLES_DIR = Path(__file__).parent / "samples"
 sample_files = sorted(SAMPLES_DIR.glob("*.png")) if SAMPLES_DIR.exists() else []
 sample_choice = st.sidebar.selectbox("Or try a bundled sample", ["(none)"] + [p.name for p in sample_files])
+tau = st.sidebar.slider(
+    "Detection sensitivity", 0.0, 1.5, 1.0, step=0.1,
+    help="0 = favour overall accuracy (mostly predicts the common class). 1 = class-balanced (default, "
+         "chosen on held-out patients). Higher = flag rare beat types more readily, at the cost of more false alarms.")
+set_sensitivity(tau)
 mc_samples = st.sidebar.slider("MC-dropout passes (uncertainty)", 10, 100, 30, step=10)
 
 uploaded = st.file_uploader("ECG waveform image", type=["png", "jpg", "jpeg"])
@@ -114,6 +122,14 @@ if uploaded is not None:
               "mc_dropout_std": std_p, "uncertainty_entropy": entropy, "graph": stats}
     st.download_button("Download JSON report", json.dumps(report, indent=2),
                        file_name="ecg_prediction.json", mime="application/json")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf_path = Path(tmp) / "report.pdf"
+        uploaded.seek(0)
+        build_report(waveform, pdf_path, source_name=getattr(uploaded, "name", "uploaded image"),
+                     source_image=io.BytesIO(uploaded.read()), mc_samples=mc_samples)
+        pdf_bytes = pdf_path.read_bytes()
+    st.download_button("Download PDF report", pdf_bytes, file_name="ecg_report.pdf", mime="application/pdf")
 
     with st.expander("Why this prediction? (gradient x input saliency)", expanded=True):
         st.caption(

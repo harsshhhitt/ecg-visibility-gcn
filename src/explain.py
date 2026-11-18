@@ -16,16 +16,15 @@ from torch_geometric.data import Batch
 
 from config import AAMI_CLASSES, CHECKPOINT_DIR, FIGURES_DIR, IDX_TO_CLASS
 from model import ECGGCN
-from predict import load_model
+from predict import build_graph, load_model
 from preprocessing import Beat
 from visibility_graph import beat_to_graph, beat_to_networkx
 
 
-def node_saliency(waveform, checkpoint_path=CHECKPOINT_DIR / "best_model.pt", target=None, device="cpu"):
+def node_saliency(waveform, checkpoint_path=None, target=None, device="cpu"):
     """Returns (saliency[n_nodes] in [0, 1], predicted_label, probs dict)."""
-    beat = Beat(record_id=-1, r_peak_sample=len(waveform) // 2, waveform=waveform, label="N")
-    data = beat_to_graph(beat)
     model = load_model(checkpoint_path, device)
+    data = build_graph(waveform, model)
 
     batch = Batch.from_data_list([data]).to(device)
     batch.x.requires_grad_(True)
